@@ -1,0 +1,235 @@
+// E1 contract tests (TASKS E1): every tool's request against a fake
+// `rootmark serve` is exactly the contract's (docs/CLIENT_CONTRACT.md §1);
+// every §3 code maps to an `RootmarkError` with that code (and the hint);
+// no server → passive state; a tool outside the contract does not compile.
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  connect,
+  describeError,
+  ERROR_STATUS,
+  RootmarkClient,
+  RootmarkError,
+  readSettings,
+  tomlValue,
+  TOOLS,
+  type ToolArgs,
+  type ToolName,
+  type VaultReader,
+} from "../src/api";
+import { fetchTransport, startFake, type Fake } from "./fake-server";
+import { SAMPLES } from "./samples";
+
+const TOKEN = "a".repeat(64);
+let fake: Fake;
+let client: RootmarkClient;
+
+beforeEach(async () => {
+  fake = await startFake();
+  client = new RootmarkClient({ baseUrl: fake.url, token: TOKEN, consumer: "rootmark-obsidian/0.1.0" }, fetchTransport);
+});
+afterEach(async () => {
+  await fake.close();
+});
+
+/** One valid argument object per contract tool. */
+const ARGS: { [T in ToolName]: ToolArgs[T] } = {
+  status: {},
+  search: { query: "kalimba", k: 5, mode: "lexical", include_proposal: true },
+  read_block: { doc_path: "a.md", lineage_id: "0".repeat(32) },
+  history: { lineage_id: "0".repeat(32) },
+  blame: { doc_path: "a.md", at: "yesterday" },
+  propose: { doc_path: "agent/p.md", content: "# P", reason: "r", mode: "create" },
+  promote: { lineage_id: "0".repeat(32), reason: "approved" },
+  checkpoint: { name: "yesterday" },
+  checkpoints: {},
+  trace: { since_seq: 0, consumer: "scene-agent/1.0" },
+  events: { since_seq: 0, kinds: ["Promoted"], limit: 10 },
+};
+
+describe("requests (contract §1)", () => {
+  it.each(TOOLS.map((t) => [t]))("%s: POST /v1/<tool>, bearer token, X-Consumer, JSON body = arguments", async (tool) => {
+    // the loop's tool is a union: the dynamic call goes through an untyped
+    // view (statically each call is typed; see the compile-error test)
+    fake.reply(200, SAMPLES[tool]);
+    const dyn = client.call.bind(client) as unknown as (t: ToolName, a: unknown) => Promise<unknown>;
+    await dyn(tool, ARGS[tool]);
+    expect(fake.requests).toHaveLength(1);
+    const r = fake.requests[0];
+    expect(r?.method).toBe("POST");
+    expect(r?.path).toBe(`/v1/${tool}`);
+    expect(r?.headers.authorization).toBe(`Bearer ${TOKEN}`);
+    expect(r?.headers["x-consumer"]).toBe("rootmark-obsidian/0.1.0");
+    expect(r?.headers["content-type"]).toBe("application/json");
+    expect(JSON.parse(r?.body ?? "")).toEqual(ARGS[tool]);
+  });
+
+  it("the contract has exactly the eleven tools of §2 (v2: events, P2-B/B3)", () => {
+    expect([...TOOLS].sort()).toEqual(
+      ["blame", "checkpoint", "checkpoints", "events", "history", "promote", "propose", "read_block", "search", "status", "trace"],
+    );
+  });
+
+  it("status() is GET /v1/status without a body", async () => {
+    fake.reply(200, SAMPLES.status);
+    await client.status();
+    const r = fake.requests[0];
+    expect(r?.method).toBe("GET");
+    expect(r?.path).toBe("/v1/status");
+    expect(r?.body).toBe("");
+    expect(r?.headers["content-type"]).toBeUndefined();
+  });
+
+  it("a tool outside the contract or a wrong argument does not compile", () => {
+    // these lines are type-checked by `tsc --noEmit` (npm run lint); each
+    // directive fails the build if its call ever type-checks
+    const typeOnly = (): void => {
+      // @ts-expect-error demote is not a contract tool
+      void client.call("demote", { lineage_id: "x" });
+      // @ts-expect-error unknown argument (schemas are closed)
+      void client.call("search", { query: "x", limit: 3 });
+      // @ts-expect-error missing required reason
+      void client.call("promote", { lineage_id: "x" });
+      // @ts-expect-error mode outside the enum
+      void client.call("search", { query: "x", mode: "fuzzy" });
+      const anyTool = TOOLS[0] as ToolName;
+      // @ts-expect-error a tool name not known at compile time takes no arguments
+      void client.call(anyTool, {});
+      // @ts-expect-error an explicit union cannot carry another tool's arguments
+      void client.call<"search" | "promote">("promote", { query: "x" });
+    };
+    expect(typeof typeOnly).toBe("function");
+  });
+});
+
+describe("errors (contract §3)", () => {
+  it.each(Object.entries(ERROR_STATUS))("%s (HTTP %i) → RootmarkError with that code", async (code, status) => {
+    fake.reply(status, { error: { code, message: `m-${code}` } });
+    const e = await client.call("search", { query: "x" }).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(RootmarkError);
+    expect((e as RootmarkError).code).toBe(code);
+    expect((e as RootmarkError).status).toBe(status);
+    expect((e as RootmarkError).message).toBe(`m-${code}`);
+  });
+
+  it("the hint travels and is shown (K-E0.4)", async () => {
+    fake.reply(422, {
+      error: { code: "policy_violation", message: "denied by edit policy", hint: "start the appended text with a heading" },
+    });
+    const e = (await client.call("propose", ARGS.propose).catch((x: unknown) => x)) as RootmarkError;
+    expect(e.hint).toBe("start the appended text with a heading");
+    expect(describeError(e)).toContain("start the appended text with a heading");
+  });
+
+  it("an answer outside the contract is bad_response, never a silent success", async () => {
+    fake.reply(500, "<html>oops</html>");
+    expect(((await client.call("status", {}).catch((x: unknown) => x)) as RootmarkError).code).toBe("bad_response");
+    fake.reply(418, { error: { code: "teapot", message: "x" } });
+    expect(((await client.call("status", {}).catch((x: unknown) => x)) as RootmarkError).code).toBe("bad_response");
+    fake.reply(200, { error: { code: "internal", message: "x" } });
+    expect(((await client.call("status", {}).catch((x: unknown) => x)) as RootmarkError).code).toBe("bad_response");
+  });
+
+  it("a promote refusal is an answer, not an error (§2.4)", async () => {
+    fake.reply(200, { decision: "denied", lineage_id: "l", layer: "proposal", reason: "r", actor: { kind: "agent", id: "a/1" }, policy: "human_only", policy_version: "1" });
+    const r = await client.call("promote", { lineage_id: "0".repeat(32), reason: "approved" });
+    expect(r.decision).toBe("denied");
+  });
+});
+
+/** An in-memory vault (read-only by type). */
+const vaultOf = (files: Record<string, string>): VaultReader => ({
+  read: (p) => (p in files ? Promise.resolve(files[p] ?? "") : Promise.reject(new Error(`no ${p}`))),
+  exists: (p) => Promise.resolve(p in files),
+});
+
+describe("answers are checked against §2/§2.5 (no silent half-result)", () => {
+  it.each(TOOLS.map((t) => [t]))("%s: the real answer passes", async (tool) => {
+    fake.reply(200, SAMPLES[tool]);
+    const dyn = client.call.bind(client) as unknown as (t: ToolName, a: unknown) => Promise<unknown>;
+    await expect(dyn(tool, ARGS[tool])).resolves.toEqual(SAMPLES[tool]);
+  });
+
+  const broken: [ToolName, (o: Record<string, unknown>) => void, string][] = [
+    ["status", (o) => delete o["mdk_version"], "status.mdk_version: missing"],
+    ["status", (o) => (o["last_checkpoint"] = { checkpoint_id: 7 }), "status.last_checkpoint"],
+    ["search", (o) => ((((o["hits"] as Record<string, unknown>[])[0]) as Record<string, unknown>)["layer"] = "secret"), "not a layer"],
+    ["blame", (o) => ((((o["blocks"] as Record<string, unknown>[])[1]) as Record<string, unknown>)["seq_created"] = "1"), "seq_created: not an integer"],
+    ["history", (o) => ((((o["events"] as Record<string, unknown>[])[0]) as Record<string, unknown>)["lineage_ids"] = "x"), "not an array"],
+    ["promote", (o) => (o["decision"] = "maybe"), "neither promoted nor denied"],
+    ["trace", (o) => delete ((((o["traces"] as Record<string, unknown>[])[0]) as Record<string, unknown>)["returned"]), "returned: missing"],
+  ];
+  it.each(broken)("%s with a broken field → bad_response", async (tool, breakIt, why) => {
+    const o = structuredClone(SAMPLES[tool]) as Record<string, unknown>;
+    breakIt(o);
+    fake.reply(200, o);
+    const dyn = client.call.bind(client) as unknown as (t: ToolName, a: unknown) => Promise<unknown>;
+    const e = (await dyn(tool, ARGS[tool]).catch((x: unknown) => x)) as RootmarkError;
+    expect(e.code).toBe("bad_response");
+    expect(e.message).toContain(why);
+  });
+
+  it("a status without mdk_version keeps the plugin passive", async () => {
+    const o = structuredClone(SAMPLES.status) as Record<string, unknown>;
+    delete o["mdk_version"];
+    fake.reply(200, o);
+    const port = new URL(fake.url).port;
+    const st = await connect(
+      vaultOf({ ".rootmark/policy.toml": `[server]\nhttp_port = ${port}\n`, ".rootmark/server.token": TOKEN }),
+      fetchTransport,
+      "c",
+    );
+    expect(st.kind).toBe("offline");
+    expect(st.kind === "offline" ? st.reason : "").toMatch(/^bad_response/);
+  });
+});
+
+describe("connection (contract §1; GOAL: no server → passive)", () => {
+  const policy = '[promotion]\npolicy = "human_only"\n\n[server]\nhttp_port = 7357 # the port\n\n[identity]\nhuman_id = "ada"\n';
+
+  it("TOML values: basic and literal strings, comments, array tables", () => {
+    const t = `[identity]\nhuman_id = "a # b"  # c\n[[server]]\nhttp_port = 1\n[server]\nhttp_port = 7357\n`;
+    expect(tomlValue(t, "identity", "human_id")).toBe("a # b");
+    expect(tomlValue(t, "server", "http_port")).toBe("7357");
+    expect(tomlValue("[identity]\nhuman_id = 'x\\y'\n", "identity", "human_id")).toBe("x\\y");
+  });
+
+  it("reads [server] http_port, [identity] human_id and the token", async () => {
+    const s = await readSettings(vaultOf({ ".rootmark/policy.toml": policy, ".rootmark/server.token": `${TOKEN}\n` }));
+    expect(s).toEqual({ port: 7357, token: TOKEN, humanId: "ada" });
+    expect(tomlValue(policy, "promotion", "policy")).toBe("human_only");
+    expect(tomlValue(policy, "server", "human_id")).toBeNull();
+  });
+
+  it("without http_port, token or policy: passive with the reason", async () => {
+    for (const [files, why] of [
+      [{}, "policy.toml not found"],
+      [{ ".rootmark/policy.toml": '[server]\nmax_propose_bytes = 4\n' }, "http_port"],
+      [{ ".rootmark/policy.toml": policy }, "server.token not found"],
+      [{ ".rootmark/policy.toml": policy, ".rootmark/server.token": "short" }, "64-hex"],
+    ] as const) {
+      const st = await connect(vaultOf(files), fetchTransport, "c");
+      expect(st.kind).toBe("offline");
+      expect(st.kind === "offline" ? st.reason : "").toContain(why);
+      expect(st.kind === "offline" ? st.reason : "").toMatch(/^not_configured/);
+    }
+  });
+
+  it("nothing listening: passive (unreachable), never started", async () => {
+    const port = Number(new URL(fake.url).port);
+    await fake.close();
+    const p = policy.replace("7357", String(port));
+    const st = await connect(vaultOf({ ".rootmark/policy.toml": p, ".rootmark/server.token": TOKEN }), fetchTransport, "c");
+    expect(st.kind).toBe("offline");
+    expect(st.kind === "offline" ? st.reason : "").toMatch(/^unreachable/);
+    fake = await startFake(); // for afterEach
+  });
+
+  it("a server that answers status: online", async () => {
+    const port = Number(new URL(fake.url).port);
+    fake.reply(200, SAMPLES.status);
+    const p = policy.replace("7357", String(port));
+    const st = await connect(vaultOf({ ".rootmark/policy.toml": p, ".rootmark/server.token": TOKEN }), fetchTransport, "c");
+    expect(st.kind).toBe("online");
+    expect(fake.requests[0]?.path).toBe("/v1/status");
+  });
+});

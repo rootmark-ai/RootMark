@@ -1,0 +1,50 @@
+[package]
+name = "rootmark-server"
+version = "0.4.0"
+edition = "2021"
+description = "The rootmark binary: CLI, MCP server (rmcp, stdio), local HTTP API (axum), file watcher, server policy (P1-D)."
+license = "Apache-2.0"
+repository = "https://github.com/rootmark-ai/rootmark"
+
+[lib]
+name = "rootmarkserver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rootmark"
+path = "src/bin/rootmark.rs"
+
+# Direct dependencies are pinned exactly to releases at least 14 days old
+# at P1-D/D0 (2026-10-15; TASKS D0).
+# cargo-binstall (P1-E/E5): the release archives of scripts/release.sh /
+# .github/workflows/release.yml, one per target
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/rootmark-{ version }-{ target }{ archive-suffix }"
+bin-dir = "rootmark-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[dependencies]
+anyhow = "1.0.104"
+blake3 = { version = "1.8.7", features = ["pure"] }
+rootmark-core = { path = "../core" }
+rootmark-index = { path = "../index" }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+clap = { version = "4.6.7", features = ["derive"] }
+notify = { version = "=8.2.0", default-features = false, features = ["macos_fsevent"] }
+rmcp = { version = "=3.6.0", default-features = false, features = ["server", "macros", "transport-io"] }
+getrandom = "=0.3.4"
+# P2-0: the MAC of an attestation (HMAC-SHA256; already in the lock through ort)
+hmac-sha256 = "=1.1.15"
+schemars = "=1.2.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "0.8.23"
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "io-std", "net", "signal", "sync", "time"] }
+
+[dev-dependencies]
+# D-1: tool schemas from the official MCP Inspector checked against the
+# JSON Schema meta-schema (test only; no network resolution)
+jsonschema = { version = "=0.58.3", default-features = false }

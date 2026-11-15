@@ -1,0 +1,272 @@
+//! `docs/CLIENT_CONTRACT.md` cases no other test covers (P1-D.1/D1.5;
+//! `scripts/contract_check.sh` requires every contract code in a test).
+//! Needs the model files.
+
+use rootmarkserver::error::{code_of, Code};
+use rootmarkserver::tools::{Caller, Kernel};
+use serde_json::json;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn vault(name: &str) -> PathBuf {
+    let root =
+        std::env::temp_dir().join(format!("rootmark-contract-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let v = root.join("vault");
+    std::fs::create_dir_all(&v).unwrap();
+    std::fs::write(v.join("a.md"), "# A\n\nSome text about espresso.\n").unwrap();
+    let st = Command::new(env!("CARGO_BIN_EXE_rootmark"))
+        .args(["ingest-dir", v.to_str().unwrap(), v.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    Kernel::open(&v).unwrap().ensure_index().unwrap();
+    v
+}
+
+/// §3 `archived` (P2-R/F4, contract §2.10): a query as of a checkpoint
+/// whose file a retention prune moved to `checkpoints/archive/`.
+#[test]
+fn archived_from_a_real_call() {
+    let v = vault("archived");
+    let vs = v.to_str().unwrap();
+    let rm = |args: &[&str]| -> serde_json::Value {
+        let o = Command::new(env!("CARGO_BIN_EXE_rootmark"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
+    let mut cps = Vec::new();
+    for i in 0..2 {
+        std::fs::write(
+            v.join("a.md"),
+            format!("# A\n\nSome text about espresso {i}.\n"),
+        )
+        .unwrap();
+        rm(&["ingest", vs, v.join("a.md").to_str().unwrap()]);
+        cps.push(
+            rm(&["checkpoint", "create", vs])["checkpoint_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    std::fs::write(
+        v.join(".rootmark/policy.toml"),
+        format!(
+            "{}\n[retention]\nkeep_checkpoints = 1\n",
+            rootmarkserver::config::default_recipe()
+        ),
+    )
+    .unwrap();
+    rm(&["prune", vs, "--now-ms", "0"]);
+    let k = Kernel::open(&v).unwrap();
+    expect_code(
+        &k,
+        "search",
+        json!({"query": "espresso", "at": cps[0]}),
+        Code::Archived,
+    );
+}
+
+/// §3 `internal`: a failure of the vault or its index, not of the call —
+/// here an index file that does not match its manifest — is `internal`
+/// (HTTP 500), never a silent empty result; the call writes no trace. (An
+/// unreadable manifest is `index_stale` since K-E1.2.)
+#[test]
+fn a_damaged_index_is_internal() {
+    let v = vault("internal");
+    let r = v.join(".rootmark/index/records.jsonl");
+    let mut recs = std::fs::read(&r).unwrap();
+    recs.extend_from_slice(b"\n");
+    std::fs::write(&r, recs).unwrap();
+    let k = Kernel::open(&v).unwrap();
+    let e = k
+        .call(
+            "search",
+            &json!({"query": "espresso"}),
+            Caller::mcp(Some("c/1")),
+        )
+        .unwrap_err();
+    assert_eq!(code_of(&e), Code::Internal, "{e:#}");
+    assert_eq!(Code::Internal.http_status(), 500);
+    let traces = v.join(".rootmark/traces.jsonl");
+    assert!(!traces.exists() || std::fs::read_to_string(traces).unwrap().is_empty());
+}
+
+/// §3: every code's HTTP status, as the contract's table states.
+#[test]
+fn http_statuses_of_the_codes() {
+    let want = [
+        (Code::InvalidArguments, 400),
+        (Code::EmptyQuery, 400),
+        (Code::PathOutsideVault, 400),
+        (Code::Denied, 403),
+        (Code::NotFound, 404),
+        (Code::Exists, 409),
+        (Code::TooLarge, 413),
+        (Code::HeadingNotFound, 422),
+        (Code::PolicyViolation, 422),
+        (Code::IndexStale, 503),
+        // P2-A/F2: an older rootmark's index (P2-A/A2)
+        (Code::MigrationRequired, 503),
+        // P2-R/F4: a checkpoint a retention prune archived (P2-R/R2)
+        (Code::Archived, 410),
+        (Code::Internal, 500),
+    ];
+    assert_eq!(want.len(), Code::ALL.len());
+    for (c, s) in want {
+        assert_eq!(c.http_status(), s, "{}", c.as_str());
+    }
+}
+
+// ---- every tool and every code of the contract from a real call
+// (`scripts/contract_check.sh` matches `call_tool(&k, "<tool>"` and
+// `expect_code(&k, … Code::<Variant>);` in this file, comments stripped)
+
+fn call_tool(k: &Kernel, tool: &str, args: serde_json::Value) -> serde_json::Value {
+    k.call(tool, &args, Caller::mcp(Some("contract/1.0")))
+        .unwrap_or_else(|e| panic!("{tool}: {e:#}"))
+}
+
+fn expect_code(k: &Kernel, tool: &str, args: serde_json::Value, want: Code) {
+    let e = k
+        .call(tool, &args, Caller::mcp(Some("contract/1.0")))
+        .expect_err(tool);
+    assert_eq!(code_of(&e), want, "{tool}: {e:#}");
+}
+
+#[test]
+fn every_tool_answers() {
+    let v = vault("tools");
+    let k = Kernel::open(&v).unwrap();
+    let st = call_tool(&k, "status", json!({}));
+    assert_eq!(st["spec_version"], rootmarkserver::tools::SPEC_VERSION);
+    let s = call_tool(&k, "search", json!({"query": "espresso"}));
+    let lineage = s["hits"][0]["lineage_ids"][0].clone();
+    let rb = call_tool(
+        &k,
+        "read_block",
+        json!({"doc_path": "a.md", "lineage_id": lineage}),
+    );
+    assert_eq!(rb["block"]["block"]["layer"], "canonical");
+    let h = call_tool(&k, "history", json!({"lineage_id": lineage}));
+    assert!(!h["events"].as_array().unwrap().is_empty());
+    let b = call_tool(&k, "blame", json!({"doc_path": "a.md"}));
+    assert_eq!(b["blocks"].as_array().unwrap().len(), 2);
+    let p = call_tool(
+        &k,
+        "propose",
+        json!({"doc_path": "agent/p.md", "content": "# P\n\nAgent text.", "reason": "contract"}),
+    );
+    let pl = p["blocks"][1]["lineage_id"].clone();
+    let pr = call_tool(
+        &k,
+        "promote",
+        json!({"lineage_id": pl, "reason": "contract"}),
+    );
+    assert_eq!(pr["decision"], "denied");
+    let c = call_tool(&k, "checkpoint", json!({"name": "contract"}));
+    let cs = call_tool(&k, "checkpoints", json!({}));
+    assert!(cs["checkpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["checkpoint_id"] == c["checkpoint_id"] && x["name"] == "contract"));
+    let t = call_tool(&k, "trace", json!({"consumer": "contract/1.0"}));
+    assert_eq!(t["traces"].as_array().unwrap().len(), 2);
+    // P2-R/R0 (b), freeze exception P2-R/F1: the 11th tool (P2-B, K-P2B.4)
+    let e = call_tool(&k, "events", json!({"since_seq": 0, "limit": 5}));
+    assert_eq!(e["events"].as_array().unwrap().len(), 5);
+    assert_eq!(e["next_seq"], 5);
+}
+
+#[test]
+fn every_code_from_a_real_call() {
+    let v = vault("codes");
+    let k = Kernel::open(&v).unwrap();
+    expect_code(
+        &k,
+        "search",
+        json!({"query": "x", "mode": "bogus"}),
+        Code::InvalidArguments,
+    );
+    expect_code(&k, "search", json!({"query": " "}), Code::EmptyQuery);
+    expect_code(
+        &k,
+        "propose",
+        json!({"doc_path": "../x.md", "content": "x", "reason": "r"}),
+        Code::PathOutsideVault,
+    );
+    expect_code(
+        &k,
+        "propose",
+        json!({"doc_path": "a.md", "content": "x", "reason": "r"}),
+        Code::Exists,
+    );
+    expect_code(&k, "history", json!({"lineage_id": "0123"}), Code::NotFound);
+    expect_code(
+        &k,
+        "propose",
+        json!({"doc_path": "a.md", "mode": "replace_section", "heading": "Nope", "content": "x", "reason": "r"}),
+        Code::HeadingNotFound,
+    );
+    expect_code(
+        &k,
+        "propose",
+        json!({"doc_path": "a.md", "mode": "replace_section", "heading": "A", "content": "x", "reason": "r"}),
+        Code::Denied,
+    );
+    std::fs::write(
+        v.join(".rootmark/policy.toml"),
+        rootmarkserver::config::default_recipe()
+            .replace("max_propose_bytes = 1048576", "max_propose_bytes = 4"),
+    )
+    .unwrap();
+    expect_code(
+        &k,
+        "propose",
+        json!({"doc_path": "big.md", "content": "five!", "reason": "r"}),
+        Code::TooLarge,
+    );
+    std::fs::write(v.join(".rootmark/policy.toml"), "promotion = 7\n").unwrap();
+    expect_code(&k, "status", json!({}), Code::PolicyViolation);
+    std::fs::remove_file(v.join(".rootmark/policy.toml")).unwrap();
+    // K-E0.4: an append to human blocks without a heading of its own
+    expect_code(
+        &k,
+        "propose",
+        json!({"doc_path": "a.md", "mode": "append", "content": "x", "reason": "r"}),
+        Code::PolicyViolation,
+    );
+    // K-E0.3: an index of another format is stale, not internal; since
+    // P2-A (P2-A/F2) an older rootmark's format is migration_required and
+    // a format this rootmark does not know stays index_stale
+    let m = v.join(".rootmark/index/manifest.json");
+    let fresh = std::fs::read_to_string(&m).unwrap();
+    std::fs::write(&m, fresh.replace("mdkernel-index/3", "mdkernel-index/2")).unwrap();
+    expect_code(
+        &k,
+        "search",
+        json!({"query": "espresso"}),
+        Code::MigrationRequired,
+    );
+    std::fs::write(&m, fresh.replace("mdkernel-index/3", "mdkernel-index/9")).unwrap();
+    expect_code(&k, "search", json!({"query": "espresso"}), Code::IndexStale);
+    // K-E1.2: an unreadable manifest is index_stale too (only a rebuild recovers it)
+    std::fs::write(v.join(".rootmark/index/manifest.json"), "{ not json").unwrap();
+    expect_code(&k, "search", json!({"query": "espresso"}), Code::IndexStale);
+    // an index file that does not match its manifest is damage: internal
+    std::fs::write(&m, &fresh).unwrap();
+    let r = v.join(".rootmark/index/records.jsonl");
+    let mut recs = std::fs::read(&r).unwrap();
+    recs.extend_from_slice(b"\n");
+    std::fs::write(&r, recs).unwrap();
+    expect_code(&k, "search", json!({"query": "espresso"}), Code::Internal);
+}
